@@ -6,10 +6,12 @@ import net.map591.mapper.WnDataMapper;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.Date;
 import java.util.HashMap;
@@ -32,7 +34,7 @@ public class LianDanRedisManager {
 
     private static final String PREFIX_LIANDAN = "ld:";
     private static final String PREFIX_WAITING_OUT = "waiting:out:";
-    private static final String PREFIX_VEHICLE_TRACKING = "tracking:";
+    private static final String PREFIX_VEHICLE_TRACKING = "tracking:vehicle:";
     private static final String PREFIX_VEHICLE_LATEST = "gps:latest:";
 
 
@@ -55,15 +57,33 @@ public class LianDanRedisManager {
             log.error("联单号为空，无法创建联单：{}", record.getCzjlid());
             return;
         }
+        String plateNumber = record.getCphm();
+
+        // **关键：创建新联单前，先清除该车辆的所有旧映射**
+        String vehicleKey = PREFIX_VEHICLE_TRACKING + plateNumber;
+        String oldLdbh = redisTemplate.opsForValue().get(vehicleKey);
+        if (StringUtils.hasText(oldLdbh)) {
+            log.info("车辆{}已有活跃联单{}，将被新联单{}替换", plateNumber, oldLdbh, ldbh);
+            redisTemplate.delete(vehicleKey);
+        }
 
         String key = PREFIX_LIANDAN + ldbh;
         Map<String, String> map = new HashMap<>();
+
+        // 获取服务器当前时间作为标准时间
+        String nowTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        long nowTimestamp = System.currentTimeMillis();
 
         // 设置基本信息 - 状态直接设为运输中(2)
         map.put("ldbh", ldbh);
         map.put("cphm", record.getCphm());
         map.put("ldzt", net.map591.ai.LianDanStatus.TRANSPORTING);  // 直接设为运输中
-        map.put("createTime", String.valueOf(System.currentTimeMillis()));
+        map.put("createTime", record.getCreateTime());
+        map.put("createTimeStr", nowTime);
+
+        // 开始时间就是服务器当前时间
+        map.put("startTime", nowTime);
+        map.put("startTimestamp", String.valueOf(nowTimestamp));
 
         // 设置移出信息
         map.put("ycczjlid", record.getCzjlid());
@@ -72,6 +92,11 @@ public class LianDanRedisManager {
         map.put("ycczsj", record.getCzsj());
         map.put("ycjsgdbh", record.getJsgdbh() != null ? record.getJsgdbh() : "");
         map.put("ycczcbm", record.getCzcbm() != null ? record.getCzcbm() : "");
+
+        // 初始化轨迹信息
+        map.put("trackPoints", "0");
+        map.put("lastTrackTime", nowTime);
+        map.put("lastTrackTimestamp", String.valueOf(nowTimestamp));
 
         // 保存到Redis
         redisTemplate.opsForHash().putAll(key, map);
@@ -84,9 +109,10 @@ public class LianDanRedisManager {
                 7,
                 TimeUnit.DAYS
         );
+        log.info("设置车辆{}与联单{}的映射", record.getCphm(), ldbh);
 
         log.info("联单创建成功：{}, 状态：运输中(2), 开始时间：{}",
-                ldbh, record.getCzsj());
+                ldbh, record.getCreateTime());
 
         // 异步保存到数据库
         saveLianDanToDatabase(key, net.map591.ai.LianDanStatus.TRANSPORTING);
@@ -106,11 +132,17 @@ public class LianDanRedisManager {
             return;
         }
 
+        String plateNumber = (String) outInfo.get("cphm");
+
         // 获取当前状态，验证是否是运输中
         String currentStatus = (String) outInfo.get("ldzt");
         if (!net.map591.ai.LianDanStatus.TRANSPORTING.equals(currentStatus)) {
             log.warn("联单状态异常，当前状态：{}，期望状态：运输中(2)", currentStatus);
         }
+
+        // 获取服务器当前时间
+        String nowTime = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+        long nowTimestamp = System.currentTimeMillis();
 
         // 更新接收信息
         Map<String, String> updateMap = new HashMap<>();
@@ -127,7 +159,26 @@ public class LianDanRedisManager {
 
         redisTemplate.opsForHash().putAll(key, updateMap);
 
-        // 计算运输时长
+
+        // **关键：清除车辆与联单的映射**
+        if (StringUtils.hasText(plateNumber)) {
+            String vehicleKey = PREFIX_VEHICLE_TRACKING + plateNumber;
+            redisTemplate.delete(vehicleKey);
+            log.info("联单完成，清除车辆{}的映射", plateNumber);
+        }
+
+        // 计算运输时长...
+        String startTimestampStr = (String) outInfo.get("startTimestamp");
+        if (startTimestampStr != null) {
+            try {
+                long startTimestamp = Long.parseLong(startTimestampStr);
+                long minutes = (nowTimestamp - startTimestamp) / (60 * 1000);
+                redisTemplate.opsForHash().put(key, "transportMinutes", String.valueOf(minutes));
+                log.info("运输时长：{}分钟", minutes);
+            } catch (Exception e) {
+                log.error("计算运输时长失败", e);
+            }
+        }
 
         log.info("联单已完成：{}, 状态：已接收(3), 结束时间：{}", ldbh, inRecord.getCreateTime());
 
@@ -218,37 +269,8 @@ public class LianDanRedisManager {
         }
     }
 
-    /**
-     * 获取联单状态
-     */
-    public String getLianDanStatus(String ldbh) {
-        String key = PREFIX_LIANDAN + ldbh;
-        Object status = redisTemplate.opsForHash().get(key, "ldzt");
-        return status != null ? status.toString() : null;
-    }
 
 
-    /**
-     * 获取车辆当前联单及状态
-     */
-    public Map<String, String> getVehicleLianDanInfo(String plateNumber) {
-        String ldbh = getActiveLdbhByPlate(plateNumber);
-        if (ldbh == null) {
-            return null;
-        }
-
-        String key = PREFIX_LIANDAN + ldbh;
-        Map<Object, Object> ldInfo = redisTemplate.opsForHash().entries(key);
-
-        Map<String, String> result = new HashMap<>();
-        result.put("ldbh", ldbh);
-        result.put("ldzt", (String) ldInfo.get("ldzt"));
-        result.put("cphm", (String) ldInfo.get("cphm"));
-        result.put("ycczdd", (String) ldInfo.get("ycczdd"));
-        result.put("ycczsj", (String) ldInfo.get("ycczsj"));
-
-        return result;
-    }
 
     /**
      * 获取联单完整信息（包括轨迹）
@@ -412,26 +434,4 @@ public class LianDanRedisManager {
         return ldbh;
     }
 
-    /**
-     * 重量偏差检查（±5%）
-     */
-    private void checkWeightDeviation(Map<Object, Object> existing, Map<String, String> current) {
-        try {
-            BigDecimal outJz = new BigDecimal((String) existing.get("outJz"));
-            BigDecimal inJz = new BigDecimal(current.get("inJz"));
-
-            BigDecimal diff = inJz.subtract(outJz).abs();
-            BigDecimal percent = diff.divide(outJz, 4, RoundingMode.HALF_UP)
-                    .multiply(new BigDecimal("100"));
-
-            if (percent.compareTo(new BigDecimal("5")) > 0) {
-                // 触发重量偏差预警
-                String ldbh = (String) existing.get("ldbh");
-                alarmService.createAlarm("WEIGHT_DEVIATION",current.get("plateNumber"),
-                        String.format("重量偏差%.2f%%超过5%%", percent),ldbh);
-            }
-        } catch (Exception e) {
-            log.error("重量偏差检查失败", e);
-        }
-    }
 }

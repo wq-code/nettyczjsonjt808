@@ -1,5 +1,6 @@
 package net.map591.mapper;
 
+import net.map591.ai.RoutePlanInfo;
 import net.map591.ai.ZyClwz;
 import net.map591.ai.ZyLdjl;
 import net.map591.ai.ZyYjjl;
@@ -126,4 +127,14 @@ public interface WnDataMapper {
     void insertClwz(ZyClwz zyClwz);
 
     List<ZyClwz> selectClwzByLdbh(@Param("ldbh") String ldbh);
+
+    List<WnTransportData> selectRecentData(String sPlateName, String sSiteCode, String sDateTime, int i);
+
+    Boolean checkPointInFence(double longitude, double latitude);
+
+    Double calculateDistanceToRoute( double longitude, double latitude, String platePhone);
+
+    RoutePlanInfo getRouteInfoByPlate(String plateNumber);
+
+    double calculateDistanceWithPostGIS(double lat1, double lon1, double lat2, double lon2);
 }

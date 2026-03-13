@@ -114,13 +114,26 @@
     </select>
 
     <select id="selectTransportDetail" resultType="java.util.Map">
-        SELECT j.* FROM zy_jzljys j WHERE j.ldbh = #{ldbh}
+        SELECT ld.ldbh, ld.cphm, ld.ldzt FROM zy_ldjl ld WHERE ld.ldbh = #{ldbh}
     </select>
     <select id="selectActiveLdbhByPlate" resultType="java.lang.String">
-        SELECT ldbh FROM zy_jzljys WHERE cphm = #{platePhone} order by ldbh desc limit 1
+        SELECT ldbh
+        FROM zy_ldjl
+        WHERE cphm = #{cphm}
+        AND ldzt IN ('2', '1')
+        ORDER BY create_time DESC
+        LIMIT 1
     </select>
     <select id="selectTrackLineByLdbh" resultType="java.lang.String">
-        SELECT ST_AsText(sjlx) as trackLine FROM zy_jzljys WHERE ldbh = #{ldbh}
+        SELECT st_asText(ST_AsGeoJSON(
+                    ST_MakeLine(
+                        ST_SetSRID(
+                        ST_MakePoint(longitude::float8, latitude::float8),
+                        4326
+                        ) ORDER BY gps_time
+                        )
+                )) as trackLine
+        FROM zy_clwz WHERE ldbh = #{ldbh}
     </select>
     <select id="selectRouteInfoWithRule" resultType="java.util.Map">
         SELECT rc.cph, rt.route_name, rg.geom, rr.yz_value_min, rr.yz_value_max,rg.route_hc
@@ -559,9 +572,106 @@
     <select id="selectClwzByLdbh" resultType="net.map591.ai.ZyClwz">
         SELECT
         id, ldbh, cphm, longitude, latitude,
-        speed, direction, gps_time, create_time
+        speed, direction, gps_time as gpsTime, create_time as createTime
         FROM zy_clwz
         WHERE ldbh = #{ldbh}
         ORDER BY gps_time ASC
+    </select>
+
+
+    <!-- 查询最近相似记录 -->
+    <select id="selectRecentData" resultType="net.map591.entity.WnTransportData">
+        SELECT * FROM wn_transport_data1
+        WHERE s_plate_name = #{plateName}
+        AND s_site_code = #{siteCode}
+        AND s_date_time = #{sDateTime}
+        AND created_at >= NOW() - INTERVAL '${minutes} minutes'
+        ORDER BY created_at DESC
+    </select>
+
+
+    <!-- 检查点是否在电子围栏内 -->
+    <select id="checkPointInFence" resultType="boolean">
+        SELECT EXISTS(
+            SELECT 1 FROM fence_geom f
+            WHERE ST_Contains(
+                f.geom,
+                ST_SetSRID(ST_MakePoint(#{lng}, #{lat}), 4326)
+            )
+        )
+    </select>
+
+    <!-- 计算点到路线的距离 -->
+    <select id="calculateDistanceToRoute" resultType="double">
+        SELECT ST_Distance(
+        ST_SetSRID(ST_MakePoint(#{lng}, #{lat}), 4326)::geography,
+             (SELECT rg.geom FROM route_cph rc
+                JOIN route_geometry rg ON rc.route_id = rg.route_id
+                JOIN route_template rt ON rc.route_id = rt.id
+                JOIN route_rule rr ON rc.route_id = rr.route_id
+                WHERE rr.rule_type = '1'
+                AND  rc.cph = #{platePhone})::geography
+        )
+    </select>
+
+    <resultMap id="routePlanResultMap" type="net.map591.ai.RoutePlanInfo">
+        <id property="cph" column="cph"/>
+        <result property="routeId" column="route_id"/>
+        <result property="routeName" column="route_name"/>
+        <result property="geom" column="geom_wkt"/>
+        <result property="routeHc" column="route_hc"/>
+
+        <!-- 路线偏离规则 -->
+        <association property="deviation" javaType="net.map591.ai.RoutePlanInfo$DeviationRule">
+            <result property="yzValueMin" column="deviation_min"/>
+            <result property="yzValueMax" column="deviation_max"/>
+        </association>
+
+        <!-- 超时停留规则 -->
+        <association property="stay" javaType="net.map591.ai.RoutePlanInfo$StayTimeoutRule">
+            <result property="yzValueMin" column="stay_min"/>
+            <result property="yzValueMax" column="stay_max"/>
+        </association>
+
+        <!-- 运输超时规则 -->
+        <association property="transport" javaType="net.map591.ai.RoutePlanInfo$TransportTimeoutRule">
+            <result property="yzValueMin" column="transport_min"/>
+            <result property="yzValueMax" column="transport_max"/>
+        </association>
+    </resultMap>
+    <!-- 获取车辆路线规划信息 -->
+    <select id="getRouteInfoByPlate" resultType="net.map591.ai.RoutePlanInfo">
+        SELECT
+        rc.cph,
+        rt.id as route_id,
+        rt.route_name,
+        ST_AsText(rg.geom) as geom_wkt,
+        rg.route_hc,
+
+        -- 路线偏离规则 (rule_type = '1')
+        MAX(CASE WHEN rr.rule_type = '1' THEN rr.yz_value_min END) as deviation_min,
+        MAX(CASE WHEN rr.rule_type = '1' THEN rr.yz_value_max END) as deviation_max,
+
+        -- 超时停留规则 (rule_type = '2')
+        MAX(CASE WHEN rr.rule_type = '2' THEN rr.yz_value_min END) as stay_min,
+        MAX(CASE WHEN rr.rule_type = '2' THEN rr.yz_value_max END) as stay_max,
+
+        -- 运输超时规则 (rule_type = '3')
+        MAX(CASE WHEN rr.rule_type = '3' THEN rr.yz_value_min END) as transport_min,
+        MAX(CASE WHEN rr.rule_type = '3' THEN rr.yz_value_max END) as transport_max
+
+        FROM route_cph rc
+        JOIN route_geometry rg ON rc.route_id = rg.route_id
+        JOIN route_template rt ON rc.route_id = rt.id
+        LEFT JOIN route_rule rr ON rc.route_id = rr.route_id
+        WHERE rc.cph = #{platePhone}
+        GROUP BY rc.cph, rt.id, rt.route_name, rg.geom, rg.route_hc
+    </select>
+    <!-- 使用PostGIS计算两点距离 -->
+    <select id="calculateDistance" resultType="double">
+        SELECT ST_Distance(
+        ST_SetSRID(ST_MakePoint(#{lon1}, #{lat1}), 4326)::geography,
+        ST_SetSRID(ST_MakePoint(#{lon2}, #{lat2}), 4326)::geography
+        ) as distance
     </select>
 </mapper>

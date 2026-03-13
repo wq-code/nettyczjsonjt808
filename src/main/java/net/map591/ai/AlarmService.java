@@ -1,7 +1,9 @@
 package net.map591.ai;
 
 import com.alibaba.fastjson.JSON;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
+import net.map591.entity.LocationData;
 import net.map591.entity.ZyClczjl;
 import net.map591.mapper.WnDataMapper;
 import net.map591.service.impl.TrackWebSocketService;
@@ -10,7 +12,9 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+import java.sql.Timestamp;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
 import java.util.Date;
 import java.util.Random;
@@ -29,6 +33,249 @@ public class AlarmService {
     
     @Autowired
     private TrackWebSocketService trackWebSocketService;
+    @Autowired
+    private LianDanRedisManager lianDanRedisManager;
+    @Autowired
+    private AlarmService alarmService;
+    @Autowired
+    private ObjectMapper objectMapper;
+
+
+    public void checkGeofence(String ldbh, String plateNumber, LocationData location,String currentTrackLine ){
+        // 调用数据库函数判断点是否在电子围栏内
+        Boolean isInFence = wnDataMapper.checkPointInFence(
+                location.getLongitude(),
+                location.getLatitude()
+        );
+        if (Boolean.FALSE.equals(isInFence)) {
+            // 不在围栏内，触发预警
+            alarmService.createAlarm(
+                    AlarmType.GEOFENCE,
+                    plateNumber,
+                    String.format("车辆超出电子围栏，当前位置：(%f,%f)", location.getLongitude(), location.getLatitude()),
+                    ldbh
+            );
+        }
+    }
+
+    public void checkRouteDeviation(String ldbh, String plateNumber, LocationData location, RoutePlanInfo routePlan,String currentTrackLine) {
+        // 计算点到规划路线的距离
+        Double distance = wnDataMapper.calculateDistanceToRoute(
+                location.getLongitude(),
+                location.getLatitude(),
+                plateNumber
+        );
+        if (distance == null) return;
+        // 获取路线允许的偏离阈值
+        Double allowedDeviation = routePlan.getDeviation().getYzValueMax();
+
+        if (distance > allowedDeviation) {
+            alarmService.createRouteDeviationAlarm(
+                    ldbh,
+                    plateNumber,
+                    distance,
+                    allowedDeviation,
+                    currentTrackLine,  // 记录当前轨迹线
+                    location           // 记录当前位置
+            );
+        }
+    }
+    /**
+     * 路线偏离预警 - 记录轨迹
+     */
+    public void createRouteDeviationAlarm(String ldbh, String plateNumber,
+                                          Double distance, Double maxDeviation,
+                                          String trackLine, LocationData location) {
+        ZyYjjl alarm = new ZyYjjl();
+        alarm.setYjid(generateYjid());
+        alarm.setLdbh(ldbh);
+        alarm.setCphm(plateNumber);
+        alarm.setYjlx(AlarmType.ROUTE_DEVIATION);
+        alarm.setYjms(String.format("车辆偏离路线%.2f米，超过允许值%.2f米", distance, maxDeviation));
+        alarm.setYjsj(new Date());
+        alarm.setClzt("未处理");
+
+        // 记录预警时的轨迹线和位置
+        alarm.setTrackLine(trackLine);
+        alarm.setAlarmPoint(String.format("POINT(%f %f)",
+                location.getLongitude(), location.getLatitude()));
+
+        wnDataMapper.insertYjjl(alarm);
+
+        // WebSocket推送
+//        trackWebSocketService.pushAlarm(alarm);
+    }
+
+    public void checkStayTimeout(String ldbh, String plateNumber, LocationData location,RoutePlanInfo routePlan, String currentTrackLine) {
+        if (routePlan.getStay() == null) return;
+
+        String stayKey = "stay:" + ldbh;
+        String lastLocationJson = redisTemplate.opsForValue().get(stayKey);
+
+        if (lastLocationJson != null) {
+            try {
+                LocationData lastLocation = objectMapper.readValue(lastLocationJson, LocationData.class);
+
+                double distance = wnDataMapper.calculateDistanceWithPostGIS(
+                        lastLocation.getLatitude(), lastLocation.getLongitude(),
+                        location.getLatitude(), location.getLongitude()
+                );
+
+                // 如果移动距离小于50米，认为是停留
+                if (distance < 50) {
+                    String stayStartKey = "stay:start:" + ldbh;
+                    String stayStartStr = redisTemplate.opsForValue().get(stayStartKey);
+
+                    if (stayStartStr == null) {
+                        redisTemplate.opsForValue().set(stayStartKey,
+                                LocalDateTime.now().toString(), 1, TimeUnit.DAYS);
+                    } else {
+                        LocalDateTime stayStart = LocalDateTime.parse(stayStartStr);
+                        long minutes = ChronoUnit.MINUTES.between(stayStart, LocalDateTime.now());
+
+                        Double maxStayTime = routePlan.getStay().getYzValueMax();
+
+                        if (minutes >= maxStayTime) {
+                            // 记录停留期间的轨迹
+                            alarmService.createStayTimeoutAlarm(
+                                    ldbh,
+                                    plateNumber,
+                                    minutes,
+                                    maxStayTime,
+                                    currentTrackLine,  // 记录当前轨迹线
+                                    location,
+                                    stayStart
+                            );
+                        }
+                    }
+                } else {
+                    redisTemplate.delete("stay:start:" + ldbh);
+                }
+
+            } catch (Exception e) {
+                log.error("检查超时停留失败", e);
+            }
+        }
+
+        // 更新当前位置
+        try {
+            redisTemplate.opsForValue().set(stayKey,
+                    objectMapper.writeValueAsString(location), 1, TimeUnit.HOURS);
+        } catch (Exception e) {
+            log.error("缓存当前位置失败", e);
+        }
+    }
+    /**
+     * 超时停留预警 - 记录停留轨迹
+     */
+    public void createStayTimeoutAlarm(String ldbh, String plateNumber,
+                                       long minutes, Double maxStayTime,
+                                       String trackLine, LocationData location,
+                                       LocalDateTime stayStart) {
+        ZyYjjl alarm = new ZyYjjl();
+        alarm.setYjid(generateYjid());
+        alarm.setLdbh(ldbh);
+        alarm.setCphm(plateNumber);
+        alarm.setYjlx(AlarmType.STAY_TIMEOUT);
+        alarm.setYjms(String.format("车辆停留%d分钟，超过允许值%.0f分钟", minutes, maxStayTime));
+        alarm.setYjsj(new Date());
+        alarm.setClzt("未处理");
+
+        // 记录停留期间的轨迹和位置
+        alarm.setTrackLine(trackLine);
+        alarm.setAlarmPoint(String.format("POINT(%f %f)",
+                location.getLongitude(), location.getLatitude()));
+        alarm.setStayStartTime(Timestamp.valueOf(stayStart));
+        alarm.setStayEndTime(new Timestamp(System.currentTimeMillis()));
+
+        wnDataMapper.insertYjjl(alarm);
+
+//        trackWebSocketService.pushAlarm(alarm);
+    }
+
+    /**
+     * 运输超时检查 - 记录全程轨迹
+     */
+    public void checkTransportTimeout(String ldbh, String plateNumber,
+                                       RoutePlanInfo routePlan,
+                                       String currentTrackLine) {
+        if (routePlan.getTransport() == null) return;
+
+        String startTimeStr = getLianDanStartTime(ldbh);
+        if (startTimeStr == null) return;
+
+        LocalDateTime startTime = LocalDateTime.parse(startTimeStr);
+        long minutes = ChronoUnit.MINUTES.between(startTime, LocalDateTime.now());
+
+        Double maxTransportTime = routePlan.getTransport().getYzValueMax();
+
+        if (minutes > maxTransportTime) {
+            // 记录全程轨迹
+            alarmService.createTransportTimeoutAlarm(
+                    ldbh,
+                    plateNumber,
+                    minutes,
+                    maxTransportTime,
+                    currentTrackLine,  // 记录全程轨迹线
+                    startTime,
+                    LocalDateTime.now()
+            );
+        }
+    }
+    /**
+     * 获取联单开始时间
+     */
+    private String getLianDanStartTime(String ldbh) {
+        String key = RedisKeys.PREFIX_LIANDAN + ldbh;
+        Object startTime = redisTemplate.opsForHash().get(key, "startTime");
+        return startTime != null ? startTime.toString() : null;
+    }
+
+    /**
+     * 运输超时预警 - 记录全程轨迹
+     */
+    public void createTransportTimeoutAlarm(String ldbh, String plateNumber,
+                                            long minutes, Double maxTransportTime,
+                                            String trackLine,
+                                            LocalDateTime startTime,
+                                            LocalDateTime currentTime) {
+        ZyYjjl alarm = new ZyYjjl();
+        alarm.setYjid(generateYjid());
+        alarm.setLdbh(ldbh);
+        alarm.setCphm(plateNumber);
+        alarm.setYjlx(AlarmType.TRANSPORT_TIMEOUT);
+        alarm.setYjms(String.format("运输超时：已运行%d分钟，超过允许值%.0f分钟",
+                minutes, maxTransportTime));
+        alarm.setYjsj(new Date());
+        alarm.setClzt("未处理");
+
+        // 记录全程轨迹
+        alarm.setTrackLine(trackLine);
+        alarm.setTransportStartTime(Timestamp.valueOf(startTime));
+        alarm.setTransportCurrentTime(Timestamp.valueOf(currentTime));
+
+        wnDataMapper.insertYjjl(alarm);
+
+//        trackWebSocketService.pushAlarm(alarm);
+    }
+
+
+    public RoutePlanInfo  getRouteInfoByPlate(String plateNumber) {
+        return wnDataMapper.getRouteInfoByPlate(plateNumber);
+    }
+
+    public class AlarmType {
+        // 称重相关预警
+        public static final String WEIGHT_DEVIATION = "WEIGHT_DEVIATION";  // 重量偏差
+        public static final String DUPLICATE_UPLOAD = "DUPLICATE_UPLOAD";  // 重复上传
+        public static final String DISCONNECT = "DISCONNECT";              // 断联
+
+        // 轨迹相关预警
+        public static final String STAY_TIMEOUT = "STAY_TIMEOUT";          // 超时停留
+        public static final String TRANSPORT_TIMEOUT = "TRANSPORT_TIMEOUT"; // 运输超时
+        public static final String ROUTE_DEVIATION = "ROUTE_DEVIATION";    // 路线偏离
+        public static final String GEOFENCE = "GEOFENCE";                  // 超出电子围栏
+    }
 
 
     
@@ -62,49 +309,64 @@ public class AlarmService {
             log.error("创建预警失败", e);
         }
     }
-    
     /**
-     * 检查超时预警（定时任务）
+     * 检查断联预警 - 定时任务
+     * 每30分钟执行一次
      */
-    @Scheduled(fixedDelay = 3600000) // 每小时
-    public void checkTimeoutAlarm() {
-        log.info("开始检查超时预警");
-        
-        Set<String> keys = redisTemplate.keys("waiting:out:*");
+    @Scheduled(cron = "0 0/30 * * * ?")
+    public void checkDisconnectAlarm() {
+        log.info("开始检查断联预警");
+
+        // 查询等待队列中超过24小时的移出记录
+        Set<String> keys = redisTemplate.keys(RedisKeys.PREFIX_WAITING_OUT + "*");
         if (keys == null) return;
-        
+
         for (String key : keys) {
             String outJson = redisTemplate.opsForValue().get(key);
             if (outJson == null) continue;
-            
+
             try {
                 ZyClczjl outRecord = JSON.parseObject(outJson, ZyClczjl.class);
-                String czsj = outRecord.getCzsj();
-                
-                if (czsj == null) continue;
-                
-                // 计算时间差
-                LocalDateTime outTime = LocalDateTime.parse(czsj.replace(" ", "T"));
-                long hours = ChronoUnit.HOURS.between(outTime, LocalDateTime.now());
-                
-                if (hours >= 24) {
-                    String plateNumber = key.replace("waiting:out:", "");
-                    createAlarm("TIMEOUT", plateNumber,
-                        String.format("移出后%d小时未接收", hours),
-                        outRecord.getLdbh());
-                    
-                    // 删除已预警的key，避免重复预警
+
+                // 获取移出记录的创建时间（使用服务器时间）
+                String createTimeStr = outRecord.getCreateTime();
+                if (createTimeStr == null) continue;
+
+                LocalDateTime createTime = LocalDateTime.parse(
+                        createTimeStr,
+                        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
+                );
+
+                long hours = ChronoUnit.HOURS.between(createTime, LocalDateTime.now());
+
+                // 超过48小时未匹配接收记录
+                if (hours >= 48) {
+                    String plateNumber = key.replace(RedisKeys.PREFIX_WAITING_OUT, "");
+
+                    alarmService.createAlarm(
+                            AlarmType.DISCONNECT,
+                            plateNumber,
+                            String.format("移出后%d小时未接收，称重ID=%s",
+                                    hours, outRecord.getCzjlid()),
+                            outRecord.getLdbh()
+                    );
+
+                    // 从等待队列删除，避免重复预警
                     redisTemplate.delete(key);
+
+                    // 将联单状态更新为异常(4)
+                    lianDanRedisManager.updateLianDanStatus(outRecord.getLdbh(), "4");
                 }
+
             } catch (Exception e) {
-                log.error("检查超时预警失败", e);
+                log.error("检查断联预警失败", e);
             }
         }
     }
-    
     private String generateYjid() {
         return "YJ" + System.currentTimeMillis() + 
                String.format("%03d", new Random().nextInt(1000));
     }
+
 
 }

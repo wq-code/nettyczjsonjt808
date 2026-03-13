@@ -2,6 +2,7 @@ package net.map591.ai;
 import lombok.Data;
 
 import java.math.BigDecimal;
+import java.sql.Timestamp;
 import java.util.Date;
 
 @Data
@@ -15,4 +16,11 @@ public class ZyYjjl {
     private String clzt;            // 处理状态
     private Date clsj;              // 处理时间
     private String bz;              // 备注
+    private String trackLine;
+    private String alarmPoint;
+    private Timestamp stayStartTime;
+    private Timestamp stayEndTime;
+    private Timestamp transportStartTime;
+    private Timestamp transportCurrentTime;
+
 }

@@ -16,6 +16,7 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 @Component
@@ -90,24 +91,28 @@ public class WeighingDataProcessor {
     public void processWeighingData(WnTransportData data) {
         String detectCode = data.getSDetectCode();
 
-        // 1. 幂等检查
+        // 1. 幂等检查（数据库层面）
         if (isProcessed(detectCode)) {
             log.info("数据已处理，跳过：{}", detectCode);
             return;
         }
 
         try {
-            // 2. 保存原始数据
+
+            // 2. 检查重复内容（相同车牌、重量、时间，不同ID）
+            checkDuplicateContent(data);
+
+            // 3. 保存原始数据
             wnDataMapper.insertWnData1(data);
 
-            // 3. 保存称重记录
+            // 4. 保存称重记录
             ZyClczjl record = convertToZyClczjl(data);
             wnDataMapper.insertClczjl(record);
 
-            // 4. 联单匹配处理（此时record已经有ldbh）
+            // 5. 联单匹配处理
             handleLianDanMatching(record);
 
-            // 5. 标记为已处理（联单匹配成功后标记）
+            // 6. 标记为已处理
             markAsProcessed(detectCode);
 
             log.info("称重数据处理完成：{}, 联单号：{}", detectCode, record.getLdbh());
@@ -117,7 +122,30 @@ public class WeighingDataProcessor {
             throw new RuntimeException("处理失败", e);
         }
     }
+    /**
+     * 检查重复内容上传
+     */
+    private void checkDuplicateContent(WnTransportData data) {
+        // 查询最近10分钟内的相似记录
+        List<WnTransportData> recentData = wnDataMapper.selectRecentData(
+                data.getSPlateName(),
+                data.getSSiteCode(),
+                data.getSDateTime(),
+                40 // 40分钟内
+        );
 
+        if (!recentData.isEmpty()) {
+            // 有相似记录，触发重复上传预警
+            alarmService.createAlarm(
+                    AlarmService.AlarmType.DUPLICATE_UPLOAD,
+                    data.getSPlateName(),
+                    String.format("重复上传：相同车牌、重量在短时间内多次上传，当前ID=%s",
+                            data.getSDetectCode()),
+                    null // 还没有联单号
+            );
+            log.warn("检测到重复上传：{}", data.getSDetectCode());
+        }
+    }
     /**
      * 转换为称重记录
      */
@@ -209,7 +237,7 @@ public class WeighingDataProcessor {
         String plateNumber = record.getCphm();
         String siteCode = record.getCzdd();
 
-        if (isTransferOutSite(siteCode)) {
+        if (isTransferOutSite(siteCode)&& "皖M8A011".equals(plateNumber)||"皖N43777".equals(plateNumber)) {
             // 移出站点处理
             handleOutRecord(record);
 
@@ -301,6 +329,9 @@ public class WeighingDataProcessor {
             return;
         }
 
+        // 从czbj_rule表获取允许的偏差值
+//        BigDecimal allowedDeviation = getWeightDeviationRule();
+
         // 计算偏差百分比
         BigDecimal diff = inJz.subtract(outJz).abs();
         BigDecimal percent = diff.divide(outJz, 4, RoundingMode.HALF_UP)
@@ -318,6 +349,7 @@ public class WeighingDataProcessor {
             );
         }
     }
+
 
     /**
      * 判断是否是移出站点
