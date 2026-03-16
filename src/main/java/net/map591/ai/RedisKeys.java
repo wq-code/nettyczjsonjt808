@@ -7,7 +7,7 @@ package net.map591.ai;
 public class RedisKeys {
     
     // 联单信息
-    public static final String PREFIX_LIANDAN = "ld:info:";
+    public static final String PREFIX_LIANDAN = "ld:";
     
     // 车辆-联单映射 (统一使用这个)
     public static final String PREFIX_VEHICLE_TRACKING = "tracking:vehicle:";

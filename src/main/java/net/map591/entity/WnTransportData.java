@@ -101,4 +101,5 @@ public class WnTransportData {
     private String ldzt;
     @JsonIgnore
     private String czjlid;
+
 }

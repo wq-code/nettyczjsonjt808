@@ -11,8 +11,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
 import java.sql.Timestamp;
+import java.text.SimpleDateFormat;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.temporal.ChronoUnit;
@@ -173,7 +175,7 @@ public class AlarmService {
                                        String trackLine, LocationData location,
                                        LocalDateTime stayStart) {
         ZyYjjl alarm = new ZyYjjl();
-        alarm.setYjid(generateYjid());
+
         alarm.setLdbh(ldbh);
         alarm.setCphm(plateNumber);
         alarm.setYjlx(AlarmType.STAY_TIMEOUT);
@@ -204,7 +206,7 @@ public class AlarmService {
         String startTimeStr = getLianDanStartTime(ldbh);
         if (startTimeStr == null) return;
 
-        LocalDateTime startTime = LocalDateTime.parse(startTimeStr);
+        LocalDateTime startTime = LocalDateTime.parse(startTimeStr, DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
         long minutes = ChronoUnit.MINUTES.between(startTime, LocalDateTime.now());
 
         Double maxTransportTime = routePlan.getTransport().getYzValueMax();
@@ -226,9 +228,39 @@ public class AlarmService {
      * 获取联单开始时间
      */
     private String getLianDanStartTime(String ldbh) {
+        if (!StringUtils.hasText(ldbh)) {
+            return null;
+        }
         String key = RedisKeys.PREFIX_LIANDAN + ldbh;
+        // 1. 尝试从Redis获取
         Object startTime = redisTemplate.opsForHash().get(key, "startTime");
-        return startTime != null ? startTime.toString() : null;
+        if (startTime != null) {
+            return startTime.toString();
+        }
+        // 2. 尝试获取创建时间作为备选
+        Object createTime = redisTemplate.opsForHash().get(key, "createTimeStr");
+        if (createTime != null) {
+            log.debug("使用createTime作为联单开始时间: {}", createTime);
+            return createTime.toString();
+        }
+        // 3. 从数据库获取
+        try {
+            ZyLdjl ldjl = wnDataMapper.selectLdjlByLdbh(ldbh);
+            if (ldjl != null && ldjl.getCreateTime() != null) {
+                String dbTime = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+                        .format(ldjl.getCreateTime());
+
+                // 同步到Redis
+                redisTemplate.opsForHash().put(key, "startTime", dbTime);
+                redisTemplate.opsForHash().put(key, "createTimeStr", dbTime);
+
+                log.debug("从数据库同步联单开始时间: {}", dbTime);
+                return dbTime;
+            }
+        } catch (Exception e) {
+            log.error("从数据库查询联单时间失败", e);
+        }
+        return null;
     }
 
     /**
@@ -264,21 +296,6 @@ public class AlarmService {
         return wnDataMapper.getRouteInfoByPlate(plateNumber);
     }
 
-    public class AlarmType {
-        // 称重相关预警
-        public static final String WEIGHT_DEVIATION = "WEIGHT_DEVIATION";  // 重量偏差
-        public static final String DUPLICATE_UPLOAD = "DUPLICATE_UPLOAD";  // 重复上传
-        public static final String DISCONNECT = "DISCONNECT";              // 断联
-
-        // 轨迹相关预警
-        public static final String STAY_TIMEOUT = "STAY_TIMEOUT";          // 超时停留
-        public static final String TRANSPORT_TIMEOUT = "TRANSPORT_TIMEOUT"; // 运输超时
-        public static final String ROUTE_DEVIATION = "ROUTE_DEVIATION";    // 路线偏离
-        public static final String GEOFENCE = "GEOFENCE";                  // 超出电子围栏
-    }
-
-
-    
     /**
      * 创建预警（带联单号）
      */
@@ -292,23 +309,24 @@ public class AlarmService {
             alarm.setYjms(message);
             alarm.setYjsj(new Date());
             alarm.setClzt("未处理");
-            
+
             // 保存到数据库
             wnDataMapper.insertYjjl(alarm);
-            
+
             // 缓存到Redis（用于实时推送）
             String alarmKey = "alarm:latest:" + plateNumber;
             redisTemplate.opsForValue().set(alarmKey, JSON.toJSONString(alarm), 1, TimeUnit.DAYS);
-            
+
             log.warn("创建预警：类型={}, 车牌={}, 消息={}", alarmType, plateNumber, message);
-            
+
             // WebSocket推送预警
 //            trackWebSocketService.pushAlarm(alarm);
-            
+
         } catch (Exception e) {
             log.error("创建预警失败", e);
         }
     }
+
     /**
      * 检查断联预警 - 定时任务
      * 每30分钟执行一次
@@ -363,9 +381,26 @@ public class AlarmService {
             }
         }
     }
+
     private String generateYjid() {
-        return "YJ" + System.currentTimeMillis() + 
+        return "YJ" + System.currentTimeMillis() +
                String.format("%03d", new Random().nextInt(1000));
+    }
+
+    public class AlarmType {
+        // 称重相关预警
+        public static final String WEIGHT_DEVIATION = "WEIGHT_DEVIATION";  // 重量偏差
+        public static final String DUPLICATE_UPLOAD = "DUPLICATE_UPLOAD";  // 重复上传
+        public static final String DISCONNECT = "DISCONNECT";              // 断联
+
+        // 轨迹相关预警
+        public static final String STAY_TIMEOUT = "STAY_TIMEOUT";          // 超时停留
+        public static final String TRANSPORT_TIMEOUT = "TRANSPORT_TIMEOUT"; // 运输超时
+        public static final String ROUTE_DEVIATION = "ROUTE_DEVIATION";    // 路线偏离
+        public static final String GEOFENCE = "GEOFENCE";                  // 超出电子围栏
+
+        public static final String INVALID_WEIGHT = "INVALID_WEIGHT";      // 无效净重（为0）
+        public static final String UNAUTHORIZED_VEHICLE = "UNAUTHORIZED_VEHICLE"; // 车辆未授权
     }
 
 

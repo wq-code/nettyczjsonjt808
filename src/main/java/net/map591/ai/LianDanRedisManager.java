@@ -25,28 +25,16 @@ import static net.map591.ai.TrajectoryProcessor.PREFIX_TRACK;
 @Component
 public class LianDanRedisManager {
 
+    private static final String PREFIX_LIANDAN = "ld:";
+    private static final String PREFIX_WAITING_OUT = "waiting:out:";
+    private static final String PREFIX_VEHICLE_TRACKING = "tracking:vehicle:";
+    private static final String PREFIX_VEHICLE_LATEST = "gps:latest:";
     @Autowired
     private StringRedisTemplate redisTemplate;
     @Autowired
     private WnDataMapper wnDataMapper;
     @Autowired
     private AlarmService alarmService;
-
-    private static final String PREFIX_LIANDAN = "ld:";
-    private static final String PREFIX_WAITING_OUT = "waiting:out:";
-    private static final String PREFIX_VEHICLE_TRACKING = "tracking:vehicle:";
-    private static final String PREFIX_VEHICLE_LATEST = "gps:latest:";
-
-
-    // 联单状态枚举
-    public enum LianDanStatus {
-        WAITING_RECEIVE("待接收"),      // 只有移出记录
-        COMPLETED("已完成"),             // 两条记录齐全
-        ABNORMAL("异常");                // 异常状态
-
-        private String desc;
-        LianDanStatus(String desc) { this.desc = desc; }
-    }
 
     /**
      * 创建或更新联单
@@ -97,6 +85,9 @@ public class LianDanRedisManager {
         map.put("trackPoints", "0");
         map.put("lastTrackTime", nowTime);
         map.put("lastTrackTimestamp", String.valueOf(nowTimestamp));
+
+        String emptyTrackLine = "LINESTRING EMPTY";
+        map.put("trackLine", emptyTrackLine);  // 初始化空的轨迹线
 
         // 保存到Redis
         redisTemplate.opsForHash().putAll(key, map);
@@ -189,6 +180,7 @@ public class LianDanRedisManager {
         // 保存到数据库联单表
         saveCompletedLianDanToDatabase(key, inRecord);
     }
+
     /**
      * 保存联单到数据库（待移出状态）
      */
@@ -209,6 +201,15 @@ public class LianDanRedisManager {
             ldjl.setYcjz(parseBigDecimal((String) ldInfo.get("ycjz")));
             ldjl.setYcjsgdbh((String) ldInfo.get("ycjsgdbh"));
             ldjl.setYcczcbm((String) ldInfo.get("ycczcbm"));
+
+            // **关键：设置sjlx，确保不为空**
+            String trackLine = (String) ldInfo.get("trackLine");
+            if (StringUtils.hasText(trackLine) && !"LINESTRING EMPTY".equals(trackLine)) {
+                ldjl.setSjlx(trackLine);
+            } else {
+                // 如果没有轨迹点，设置一个默认值
+                ldjl.setSjlx("LINESTRING EMPTY");
+            }
 
             ldjl.setCreateTime(new Date());
             ldjl.setUpdateTime(new Date());
@@ -268,9 +269,6 @@ public class LianDanRedisManager {
             log.error("保存已完成联单到数据库失败", e);
         }
     }
-
-
-
 
     /**
      * 获取联单完整信息（包括轨迹）
@@ -377,6 +375,7 @@ public class LianDanRedisManager {
         String key = PREFIX_TRACK + ldbh;
         return redisTemplate.opsForValue().get(key);
     }
+
     /**
      * 更新联单状态
      */
@@ -432,6 +431,16 @@ public class LianDanRedisManager {
         }
 
         return ldbh;
+    }
+
+    // 联单状态枚举
+    public enum LianDanStatus {
+        WAITING_RECEIVE("待接收"),      // 只有移出记录
+        COMPLETED("已完成"),             // 两条记录齐全
+        ABNORMAL("异常");                // 异常状态
+
+        private String desc;
+        LianDanStatus(String desc) { this.desc = desc; }
     }
 
 }

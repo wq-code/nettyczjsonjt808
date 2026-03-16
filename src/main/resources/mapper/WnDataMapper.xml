@@ -229,7 +229,7 @@
 
     <!-- 更新轨迹 -->
     <update id="updateSjlxByLdbh">
-        UPDATE zy_jzljys
+        UPDATE zy_ldjl
         SET sjlx = #{sjlx}
         WHERE ldbh = #{ldbh}
     </update>
@@ -510,10 +510,13 @@
             SELECT 'YJ' || to_char(NOW(), 'YYYYMMDD') || LPAD(nextval('zy_yjjl_seq')::TEXT, 5, '0')
         </selectKey>
         INSERT INTO zy_yjjl (
-        yjid, ldbh, cphm, yjlx, yjms, yjsj, clzt, bz
+        yjid, ldbh, cphm, yjlx, yjms, yjsj, clzt, bz, track_line, alarm_point,
+        stay_start_time, stay_end_time, transport_start_time, transport_current_time
         ) VALUES (
         #{yjid}, #{ldbh}, #{cphm}, #{yjlx}, #{yjms},
-        #{yjsj, jdbcType=TIMESTAMP}, #{clzt}, #{bz}
+        #{yjsj, jdbcType=TIMESTAMP}, #{clzt}, #{bz}, st_asText(#{trackLine}) , st_asText(#{alarmPoint}),
+        #{stayStartTime, jdbcType=TIMESTAMP}, #{stayEndTime, jdbcType=TIMESTAMP},
+        #{transportStartTime, jdbcType=TIMESTAMP}, #{transportCurrentTime, jdbcType=TIMESTAMP}
         )
     </insert>
     <!-- 插入联单记录 -->
@@ -530,7 +533,7 @@
         #{ldid}, #{ldbh}, #{cphm}, #{ldzt},
         #{ycczjlid}, #{ycczdd}, #{ycczsj}, #{ycjz}, #{ycjsgdbh}, #{ycczcbm},
         #{jscczjlid}, #{jscczdd}, #{jscczsj}, #{jscjz}, #{jscjsgdbh}, #{jscczcbm},
-        #{sjlx}, #{createTime, jdbcType=TIMESTAMP}, #{completeTime, jdbcType=TIMESTAMP}, #{updateTime, jdbcType=TIMESTAMP}
+        st_asText(#{sjlx}), #{createTime, jdbcType=TIMESTAMP}, #{completeTime, jdbcType=TIMESTAMP}, #{updateTime, jdbcType=TIMESTAMP}
         )
     </insert>
 
@@ -560,6 +563,9 @@
 
     <!-- 插入车辆位置点 -->
     <insert id="insertClwz" parameterType="net.map591.ai.ZyClwz">
+        <selectKey keyProperty="id" resultType="long" order="BEFORE">
+            SELECT nextval('zy_clwz_seq')
+        </selectKey>
         INSERT INTO zy_clwz (
         ldbh, cphm, longitude, latitude, speed, direction, gps_time
         ) VALUES (
@@ -582,8 +588,8 @@
     <!-- 查询最近相似记录 -->
     <select id="selectRecentData" resultType="net.map591.entity.WnTransportData">
         SELECT * FROM wn_transport_data1
-        WHERE s_plate_name = #{plateName}
-        AND s_site_code = #{siteCode}
+        WHERE s_plate_name = #{sPlateName}
+        AND s_site_code = #{sSiteCode}
         AND s_date_time = #{sDateTime}
         AND created_at >= NOW() - INTERVAL '${minutes} minutes'
         ORDER BY created_at DESC
@@ -596,7 +602,7 @@
             SELECT 1 FROM fence_geom f
             WHERE ST_Contains(
                 f.geom,
-                ST_SetSRID(ST_MakePoint(#{lng}, #{lat}), 4326)
+                ST_SetSRID(ST_MakePoint(#{longitude}, #{latitude}), 4326)
             )
         )
     </select>
@@ -604,7 +610,7 @@
     <!-- 计算点到路线的距离 -->
     <select id="calculateDistanceToRoute" resultType="double">
         SELECT ST_Distance(
-        ST_SetSRID(ST_MakePoint(#{lng}, #{lat}), 4326)::geography,
+        ST_SetSRID(ST_MakePoint(#{longitude}, #{latitude}), 4326)::geography,
              (SELECT rg.geom FROM route_cph rc
                 JOIN route_geometry rg ON rc.route_id = rg.route_id
                 JOIN route_template rt ON rc.route_id = rt.id
@@ -640,7 +646,7 @@
         </association>
     </resultMap>
     <!-- 获取车辆路线规划信息 -->
-    <select id="getRouteInfoByPlate" resultType="net.map591.ai.RoutePlanInfo">
+    <select id="getRouteInfoByPlate" resultMap="routePlanResultMap">
         SELECT
         rc.cph,
         rt.id as route_id,
@@ -668,7 +674,7 @@
         GROUP BY rc.cph, rt.id, rt.route_name, rg.geom, rg.route_hc
     </select>
     <!-- 使用PostGIS计算两点距离 -->
-    <select id="calculateDistance" resultType="double">
+    <select id="calculateDistanceWithPostGIS" resultType="double">
         SELECT ST_Distance(
         ST_SetSRID(ST_MakePoint(#{lon1}, #{lat1}), 4326)::geography,
         ST_SetSRID(ST_MakePoint(#{lon2}, #{lat2}), 4326)::geography

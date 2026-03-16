@@ -1,6 +1,7 @@
 package net.map591.ai;
 
 import com.alibaba.fastjson.JSON;
+import com.sun.org.apache.xpath.internal.operations.Bool;
 import lombok.extern.slf4j.Slf4j;
 import net.map591.entity.WnTransportData;
 import net.map591.entity.ZyClczjl;
@@ -23,20 +24,16 @@ import java.util.concurrent.TimeUnit;
 @Slf4j
 public class WeighingDataProcessor {
 
-    @Autowired
-    private WnDataMapper wnDataMapper;
-
-    @Autowired
-    private LianDanRedisManager lianDanRedisManager;
-
-    @Autowired
-    private AlarmService alarmService;
-
-    @Autowired
-    private StringRedisTemplate redisTemplate;
-
     private static final String PROCESSED_KEY_PREFIX = "processed:weigh:";
     private static final String WAITING_OUT_PREFIX = "waiting:out:";
+    @Autowired
+    private WnDataMapper wnDataMapper;
+    @Autowired
+    private LianDanRedisManager lianDanRedisManager;
+    @Autowired
+    private AlarmService alarmService;
+    @Autowired
+    private StringRedisTemplate redisTemplate;
 
     /**
      * 检查数据是否已处理（幂等检查）
@@ -87,9 +84,12 @@ public class WeighingDataProcessor {
     /**
      * 处理称重数据
      */
-    @Transactional
+    @Transactional(rollbackFor = Exception.class)
     public void processWeighingData(WnTransportData data) {
         String detectCode = data.getSDetectCode();
+        String plateNumber = data.getSPlateName();
+        String siteCode = data.getSSiteCode();
+        BigDecimal netWeight = convertToBigDecimal(data.getSuttle());
 
         // 1. 幂等检查（数据库层面）
         if (isProcessed(detectCode)) {
@@ -98,18 +98,77 @@ public class WeighingDataProcessor {
         }
 
         try {
+            // 2. 净重为0检查
+            if (!isValidNetWeight(netWeight)) {
+                log.warn("净重为0或无效，不创建联单，保存数据并预警：{}", detectCode);
 
-            // 2. 检查重复内容（相同车牌、重量、时间，不同ID）
-            checkDuplicateContent(data);
+                // 保存数据（只保存原始数据，不创建联单）
+                wnDataMapper.insertWnData1(data);
 
-            // 3. 保存原始数据
+                // 创建称重记录（但不设置联单号）
+                ZyClczjl record = convertToZyClczjl(data);
+                record.setLdbh(null); // 确保不创建联单
+                wnDataMapper.insertClczjl(record);
+
+                // 标记为已处理
+                markAsProcessed(detectCode);
+
+                // 触发净重为0预警
+                alarmService.createAlarm(
+                        AlarmService.AlarmType.INVALID_WEIGHT,
+                        plateNumber,
+                        String.format("净重为0或无效，站点=%s", siteCode),
+                        null
+                );
+                return;
+            }
+
+            // 3. 检查车辆授权（仅对移出站点）
+            if (isTransferOutSite(siteCode) && !isAuthorizedVehicle(siteCode, plateNumber)) {
+                log.warn("车辆{}无权在站点{}进行移出操作", plateNumber, siteCode);
+
+                // 保存数据（只保存原始数据，不创建联单）
+                wnDataMapper.insertWnData1(data);
+
+                ZyClczjl record = convertToZyClczjl(data);
+                record.setLdbh(null);
+                wnDataMapper.insertClczjl(record);
+
+                markAsProcessed(detectCode);
+
+                // 触发车辆未授权预警
+                alarmService.createAlarm(
+                        AlarmService.AlarmType.UNAUTHORIZED_VEHICLE,
+                        plateNumber,
+                        String.format("车辆无权在站点%s进行移出操作", siteCode),
+                        null
+                );
+
+                return;
+            }
+
+
+            // 4. 检查是否是短时间内相同站点的重复称重（相同车牌、重量、时间，不同ID）
+            if (checkDuplicateContent(data)){
+                log.warn("检测到重复称重数据，不创建新联单，仅保存数据：{}", detectCode);
+                // 仍然保存数据，但不开启新联单
+                wnDataMapper.insertWnData1(data);
+                ZyClczjl record = convertToZyClczjl(data);
+                wnDataMapper.insertClczjl(record);
+                // 标记为已处理
+                markAsProcessed(detectCode);
+                return;
+            }
+
+            // 5. 正常的联单处理流程
+            //   保存原始数据
             wnDataMapper.insertWnData1(data);
 
-            // 4. 保存称重记录
+            // . 保存称重记录
             ZyClczjl record = convertToZyClczjl(data);
             wnDataMapper.insertClczjl(record);
 
-            // 5. 联单匹配处理
+            // . 联单匹配处理
             handleLianDanMatching(record);
 
             // 6. 标记为已处理
@@ -125,14 +184,15 @@ public class WeighingDataProcessor {
     /**
      * 检查重复内容上传
      */
-    private void checkDuplicateContent(WnTransportData data) {
-        // 查询最近10分钟内的相似记录
+    private boolean checkDuplicateContent(WnTransportData data) {
+        // 查询最近40分钟内的相似记录
         List<WnTransportData> recentData = wnDataMapper.selectRecentData(
                 data.getSPlateName(),
                 data.getSSiteCode(),
                 data.getSDateTime(),
                 40 // 40分钟内
         );
+
 
         if (!recentData.isEmpty()) {
             // 有相似记录，触发重复上传预警
@@ -144,7 +204,9 @@ public class WeighingDataProcessor {
                     null // 还没有联单号
             );
             log.warn("检测到重复上传：{}", data.getSDetectCode());
+            return true;
         }
+        return false;
     }
     /**
      * 转换为称重记录
@@ -237,12 +299,21 @@ public class WeighingDataProcessor {
         String plateNumber = record.getCphm();
         String siteCode = record.getCzdd();
 
-        if (isTransferOutSite(siteCode)&& "皖M8A011".equals(plateNumber)||"皖N43777".equals(plateNumber)) {
+        if (!isValidNetWeight(record.getJz())) {
+            log.warn("联单匹配时发现净重无效：{}", record.getCzjlid());
+            return;
+        }
+
+        if (isTransferOutSite(siteCode)) {
+            // 再次验证车辆授权
+            if (!isAuthorizedVehicle(siteCode, plateNumber)) {
+                log.warn("联单匹配时发现车辆{}无权在站点{}进行移出操作", plateNumber, siteCode);
+                return;
+            }
             // 移出站点处理
             handleOutRecord(record);
-
         } else if (isTransferInSite(siteCode)) {
-            // 接收站点处理
+            // 接收站点处理（无需验证车辆）
             handleInRecord(record);
         }
     }
@@ -319,6 +390,7 @@ public class WeighingDataProcessor {
 
     /**
      * 重量偏差检查
+     * （接收量-移出量）/移出量 *100% > 5%
      */
     private void checkWeightDeviation(ZyClczjl outRecord, ZyClczjl inRecord) {
         BigDecimal outJz = outRecord.getJz() != null ? outRecord.getJz() : BigDecimal.ZERO;
@@ -340,7 +412,7 @@ public class WeighingDataProcessor {
         if (percent.compareTo(new BigDecimal("5")) > 0) {
             String message = String.format("重量偏差%.2f%%超过5%% (移出:%.2fkg, 接收:%.2fkg)",
                     percent, outJz, inJz);
-
+            log.info("发生重量偏差预警：{}", message);
             alarmService.createAlarm(
                     "WEIGHT_DEVIATION",
                     outRecord.getCphm(),
@@ -349,7 +421,30 @@ public class WeighingDataProcessor {
             );
         }
     }
-
+    /**
+     * 检查车辆是否属于该站点的专属车辆
+     */
+    private boolean isAuthorizedVehicle(String siteCode, String plateNumber) {
+        // 站点112661的专属车辆：皖M8A011
+        if ("112661".equals(siteCode)) {
+            return "皖M8A011".equals(plateNumber);
+        }
+        // 站点112663的专属车辆：皖N43777
+        else if ("112663".equals(siteCode)) {
+            return "皖N43777".equals(plateNumber);
+        }
+        // 接收站点112662，任何车辆都可以进入
+        else if ("112662".equals(siteCode)) {
+            return true;
+        }
+        return false;
+    }
+    /**
+     * 检查净重是否有效
+     */
+    private boolean isValidNetWeight(BigDecimal netWeight) {
+        return netWeight != null && netWeight.compareTo(BigDecimal.ZERO) > 0;
+    }
 
     /**
      * 判断是否是移出站点

@@ -128,7 +128,7 @@ public interface WnDataMapper {
 
     List<ZyClwz> selectClwzByLdbh(@Param("ldbh") String ldbh);
 
-    List<WnTransportData> selectRecentData(String sPlateName, String sSiteCode, String sDateTime, int i);
+    List<WnTransportData> selectRecentData(String sPlateName, String sSiteCode, String sDateTime, int minutes);
 
     Boolean checkPointInFence(double longitude, double latitude);
 

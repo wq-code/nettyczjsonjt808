@@ -10,6 +10,7 @@ import net.map591.service.impl.TrackWebSocketService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.util.StringUtils;
 
 import java.math.BigDecimal;
@@ -30,34 +31,27 @@ import java.util.concurrent.TimeUnit;
 @Service
 public class TrajectoryProcessor {
 
-    @Autowired
-    private StringRedisTemplate redisTemplate;
-
-    @Autowired
-    private WnDataMapper wnDataMapper;
-
-    @Autowired
-    private LianDanRedisManager lianDanRedisManager;
-
-    @Autowired
-    private AlarmService alarmService;
-
-    @Autowired
-    private TrackWebSocketService trackWebSocketService;
-
-    @Autowired
-    private ObjectMapper objectMapper;
-
+    public static final String PREFIX_TRACK = "track:line:";
     // Redis key前缀
     private static final String PREFIX_LIANDAN = "ld:info:";
     private static final String PREFIX_VEHICLE_TRACKING = "tracking:vehicle:";
-    public static final String PREFIX_TRACK = "track:line:";
     private static final String PREFIX_LAST_TIME = "last:time:";
     private static final String PREFIX_LATEST_GPS = "gps:latest:";
-
     // 日期格式化
     private static final DateTimeFormatter DATE_FORMATTER =
             DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    @Autowired
+    private StringRedisTemplate redisTemplate;
+    @Autowired
+    private WnDataMapper wnDataMapper;
+    @Autowired
+    private LianDanRedisManager lianDanRedisManager;
+    @Autowired
+    private AlarmService alarmService;
+    @Autowired
+    private TrackWebSocketService trackWebSocketService;
+    @Autowired
+    private ObjectMapper objectMapper;
 
     /**
      * 处理轨迹点数据（由JT/T808协议调用）
@@ -98,6 +92,9 @@ public class TrajectoryProcessor {
 
             // 4. 保存轨迹点到数据库
             saveTrackPoint(ldbh, locationData);
+
+            // **关键：更新轨迹线（确保第一个点也能正确更新）**
+            updateTrackLine(ldbh, locationData);
 
             // 5. 获取该联单的路线规划信息
             RoutePlanInfo routePlan  = alarmService.getRouteInfoByPlate(plateNumber);
@@ -142,8 +139,13 @@ public class TrajectoryProcessor {
      * 构建当前轨迹线（从数据库查询）
      */
     private String buildCurrentTrackLine(String ldbh) {
-        // 使用PostGIS直接从数据库生成轨迹线
-        return wnDataMapper.selectTrackLineByLdbh(ldbh);
+        String trackLine = wnDataMapper.selectTrackLineByLdbh(ldbh);
+        if (!StringUtils.hasText(trackLine)) {
+            // 如果数据库中没有，尝试从Redis获取
+            String trackKey = RedisKeys.PREFIX_TRACK + ldbh;
+            trackLine = redisTemplate.opsForValue().get(trackKey);
+        }
+        return trackLine != null ? trackLine : "LINESTRING EMPTY";
     }
 
     /**
@@ -270,10 +272,12 @@ public class TrajectoryProcessor {
                 location.getLongitude(), location.getLatitude());
 
         String newTrack;
-        if (!StringUtils.hasText(existingTrack)) {
+        if (!StringUtils.hasText(existingTrack) || "LINESTRING EMPTY".equals(existingTrack)) {
+            // 第一个点，创建包含一个点的LINESTRING
             newTrack = "LINESTRING(" + newPoint + ")";
+            log.debug("创建初始轨迹线：{}", newTrack);
         } else {
-            // 提取已有坐标
+            // 已有轨迹线，追加点
             String coords = existingTrack
                     .replace("LINESTRING(", "")
                     .replace(")", "");
@@ -283,17 +287,31 @@ public class TrajectoryProcessor {
         // 保存到Redis，设置7天过期
         redisTemplate.opsForValue().set(trackKey, newTrack, 7, TimeUnit.DAYS);
 
-//        // 异步更新数据库中的轨迹线（每10个点更新一次，减少数据库压力）
-//        String trackCountStr = (String) redisTemplate.opsForHash().get(
-//                PREFIX_LIANDAN + ldbh, "trackPoints");
-//        int trackCount = trackCountStr != null ? Integer.parseInt(trackCountStr) : 0;
-//
-//        if (trackCount % 10 == 0) {
-//            CompletableFuture.runAsync(() -> {
-//                wnDataMapper.updateSjlxByLdbh(ldbh, newTrack);
-//                log.debug("异步更新联单{}轨迹线到数据库，当前点数：{}", ldbh, trackCount);
-//            });
-//        }
+        String ldKey = RedisKeys.PREFIX_LIANDAN + ldbh;
+        redisTemplate.opsForHash().put(ldKey, "trackLine", newTrack);
+
+        Long currentCount  = redisTemplate.opsForHash().increment(ldKey, "trackPoints", 1);
+
+
+        // **关键：同步更新数据库，确保第一个点能成功**
+        if (currentCount == 1) {
+            // 第一个点必须同步更新
+            try {
+                wnDataMapper.updateSjlxByLdbh(ldbh, newTrack);
+                log.info("同步更新联单{}初始轨迹线到数据库成功", ldbh);
+            } catch (Exception e) {
+                log.error("同步更新初始轨迹线失败", e);
+            }
+        } else if (currentCount % 100 == 0) {
+            // 每10个点同步更新一次
+            try {
+                wnDataMapper.updateSjlxByLdbh(ldbh, newTrack);
+                log.info("同步更新联单{}轨迹线到数据库成功，当前点数：{}", ldbh, currentCount);
+            } catch (Exception e) {
+                log.error("同步更新轨迹线失败", e);
+            }
+        }
+
     }
 
     /**

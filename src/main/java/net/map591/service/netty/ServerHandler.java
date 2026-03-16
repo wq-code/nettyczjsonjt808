@@ -32,6 +32,7 @@ import javax.annotation.PostConstruct;
 import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.Arrays;
 import java.util.List;
@@ -64,8 +65,6 @@ public class ServerHandler extends ChannelInboundHandlerAdapter {
     private LocationServiceImpl locationService;
     @Autowired
     private  ObjectMapper objectMapper ;
-    @Autowired
-    private WnDataAndImageImpl2 wnDataAndImageImpl2;
     @Autowired
     private WnDataAndImageImpl wnDataAndImageImpl;
     @Autowired
