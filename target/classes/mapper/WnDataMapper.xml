@@ -1,0 +1,683 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+
+<mapper namespace="net.map591.mapper.WnDataMapper">
+
+    <select id="selectYxGzByCph" resultType="Map">
+        SELECT
+        rt.route_name, rt.start_unit_id, rt.end_unit_id,
+        rg.start_point_hc, rg.end_point_hc, rg.route_hc,
+        st_asText(rg.geom) as geom
+        FROM route_cph rc
+        JOIN route_geometry rg ON rc.route_id = rg.route_id
+        JOIN route_template rt ON rc.route_id = rt.id
+        WHERE rc.cph =#{sPlateName}
+    </select>
+
+
+    <!-- ==================== 编号生成相关查询 ==================== -->
+
+
+    <!-- 查询最大联单编号（ldbh），用于生成新联单号（加锁） -->
+    <select id="selectLdbhMaxForUpdate" resultType="java.lang.String">
+        SELECT ldbh FROM public.zy_jzljyc
+        WHERE ldbh LIKE CONCAT(#{datePrefix}, '%')
+        ORDER BY ldbh DESC
+        LIMIT 1
+        FOR UPDATE
+    </select>
+
+    <!-- ==================== 基础信息查询 ==================== -->
+
+    <!-- 根据车牌号查询所属运输企业名称 -->
+    <select id="selectYsqymcByPlateName" resultType="java.lang.String">
+        SELECT ssqymc FROM public.jcss_jsy
+        WHERE #{sPlateName} = ANY(string_to_array(bdclhp, ' '))
+        LIMIT 1
+    </select>
+
+    <!-- 根据站点名称获取单位编码（jsgdbh） -->
+    <select id="selectYcbhBySiteName" resultType="java.lang.String">
+        SELECT a.bh FROM (
+        SELECT wsclcbh AS bh, wsclcmc AS name FROM jcss_wsclc
+        UNION ALL
+        SELECT czcbm AS bh, czcmc AS name FROM jcss_ljcz
+        ) a WHERE a.name = #{factName} LIMIT 1
+    </select>
+
+    <!-- 根据站点名称获取接收单位编码 -->
+    <select id="selectJsdwBySiteName" resultType="java.lang.String">
+        SELECT a.bh FROM (
+        SELECT czcbm AS bh, czcmc AS name FROM jcss_ljcz
+        ) a WHERE a.name = #{factName} LIMIT 1
+    </select>
+
+    <!-- 根据站点名称获取称重磅编号 -->
+    <select id="selectCzbbmYcbhByName" resultType="java.lang.String">
+        SELECT czbbh FROM public.jcss_czp WHERE ssdwbm = #{factName}
+    </select>
+
+    <!-- ==================== 业务查询 ==================== -->
+
+    <!-- 根据车牌和站点代码查询当天是否有未完成的称重记录 -->
+    <select id="selectClczjlByPlateAndDate" resultType="java.util.Map">
+        SELECT czjlid FROM public.zy_clczjl
+        WHERE cphm = #{plate}
+        AND czdd IN (SELECT wsclcmc FROM jcss_wsclc WHERE wsclcbh = #{siteCode})
+        AND DATE(czsj) = CURRENT_DATE
+        ORDER BY czsj DESC LIMIT 1
+    </select>
+
+    <!-- 根据车牌和站点查询该车从污水厂的联单号 -->
+    <select id="selectLdbhByPlateAndSite" resultType="java.lang.String">
+        SELECT ldbh FROM public.zy_jzljyc
+        WHERE yscph = #{plate}
+        AND jsgdbh IN (SELECT wsclcbh FROM jcss_wsclc WHERE wsclcbh = #{siteCode})
+        AND DATE(TO_TIMESTAMP(ycrq::TEXT || ' ' || ycsj::TEXT, 'YYYY-MM-DD HH24:MI:SS')) = CURRENT_DATE
+        ORDER BY ycrq DESC, ycsj DESC LIMIT 1
+    </select>
+
+    <!-- 查询某车牌在指定站点最近一次发出的、未完成的联单编号 -->
+    <select id="selectLatestLdbhByPlateAndSite" resultType="java.lang.String">
+        SELECT y.ldbh
+        FROM zy_jzljyc y
+        INNER JOIN zy_clczjl c ON y.ldbh = c.ldbh
+        WHERE c.cphm = #{plateNumber}
+        AND c.czcbm = #{siteCode}
+        AND c.czlx = '3'
+        AND y.ldzt IN ('1', '2', '3')
+        ORDER BY c.czsj DESC
+        LIMIT 1
+    </select>
+
+    <!-- ==================== 联单状态查询 ==================== -->
+
+    <!-- 查询运输中联单 -->
+    <select id="selectTransportingLianDanByPlate" resultType="java.lang.String">
+        SELECT yc.ldbh
+        FROM zy_jzljyc yc
+        WHERE yc.yscph = #{plateName}
+        AND yc.ldzt = #{ldzt}
+        ORDER BY yc.ycrq DESC, yc.ycsj DESC
+        LIMIT 1
+    </select>
+
+    <!-- 查询已接收联单 -->
+    <select id="selectReceivedLianDanByPlate" resultType="java.lang.String">
+        SELECT js.ldbh
+        FROM zy_jzljjs js
+        WHERE js.cphm = #{plateName}
+        AND js.ldzt = #{ldzt}
+        ORDER BY js.snrq DESC, js.snsj DESC
+        LIMIT 1
+    </select>
+
+    <select id="selectTransportDetail" resultType="java.util.Map">
+        SELECT ld.ldbh, ld.cphm, ld.ldzt FROM zy_ldjl ld WHERE ld.ldbh = #{ldbh}
+    </select>
+    <select id="selectActiveLdbhByPlate" resultType="java.lang.String">
+        SELECT ldbh
+        FROM zy_ldjl
+        WHERE cphm = #{cphm}
+        AND ldzt IN ('2', '1')
+        ORDER BY create_time DESC
+        LIMIT 1
+    </select>
+    <select id="selectTrackLineByLdbh" resultType="java.lang.String">
+        SELECT st_asText(ST_AsGeoJSON(
+                    ST_MakeLine(
+                        ST_SetSRID(
+                        ST_MakePoint(longitude::float8, latitude::float8),
+                        4326
+                        ) ORDER BY gps_time
+                        )
+                )) as trackLine
+        FROM zy_clwz WHERE ldbh = #{ldbh}
+    </select>
+    <select id="selectRouteInfoWithRule" resultType="java.util.Map">
+        SELECT rc.cph, rt.route_name, rg.geom, rr.yz_value_min, rr.yz_value_max,rg.route_hc
+        FROM route_cph rc
+        JOIN route_geometry rg ON rc.route_id = rg.route_id
+        JOIN route_template rt ON rc.route_id = rt.id
+        JOIN route_rule rr ON rc.route_id = rr.route_id
+        WHERE rc.cph = #{platePhone} AND rr.rule_type = #{ruleType}
+    </select>
+    <select id="checkRouteDeviation" resultType="map">
+        WITH vehicle_route  AS(
+            SELECT rc.cph, rt.route_name, rg.geom, rr.yz_value_min, rr.yz_value_max,rg.route_hc
+            FROM route_cph rc
+            JOIN route_geometry rg ON rc.route_id = rg.route_id
+            JOIN route_template rt ON rc.route_id = rt.id
+            JOIN route_rule rr ON rc.route_id = rr.route_id
+            WHERE rr.rule_type = '1'
+            AND  rc.cph = #{platePhone}
+        )
+        SELECT
+            CASE
+                WHEN vr.geom IS NULL THEN 'NO_ROUTE'
+                WHEN NOT ST_DWithin(
+                    ST_Point(#{longitude}, #{latitude})::geography,
+                    vr.geom::geography,
+                    vr.route_hc
+                )
+            THEN 'DEVIATION'
+            ELSE 'NORMAL'
+            END AS is_deviation
+            ,
+            round(
+                ST_Distance(
+                    ST_Point(#{longitude}, #{latitude})::geography,
+                    vr.geom::geography
+                )::numeric
+            , 2)::TEXT AS czyf
+
+        FROM vehicle_route vr
+    </select>
+    <select id="getRouteRule3ByPlatePhone" resultType="java.util.Map">
+        SELECT rc.cph, rt.route_name, rg.geom, rr.yz_value_min, rr.yz_value_max,rg.route_hc
+        FROM route_cph rc
+        JOIN route_geometry rg ON rc.route_id = rg.route_id
+        JOIN route_template rt ON rc.route_id = rt.id
+        JOIN route_rule rr ON rc.route_id = rr.route_id
+        WHERE rr.rule_type = '3'
+        AND  rc.cph = #{platePhone}
+    </select>
+    <select id="getYcsjByLdbh" resultType="java.util.Map">
+        SELECT (ycrq || ' ' || ycsj) AS sj
+        FROM "public".zy_jzljyc yc
+        WHERE ldbh=#{activeLdbh}
+        and ldzt='2'
+        AND yscph=#{platePhone}
+    </select>
+    <select id="getRouteRule4ByPlatePhone" resultType="java.util.Map">
+        SELECT rc.cph, rt.route_name, rg.geom, rr.yz_value_min, rr.yz_value_max,rg.route_hc
+        FROM route_cph rc
+        JOIN route_geometry rg ON rc.route_id = rg.route_id
+        JOIN route_template rt ON rc.route_id = rt.id
+        JOIN route_rule rr ON rc.route_id = rr.route_id
+        WHERE rr.rule_type = '4'
+        AND  rc.cph = #{platePhone}
+    </select>
+    <select id="selectDistinctTrackPointsInWindow" resultType="net.map591.entity.LocationData">
+        SELECT
+        gps_time as gpsTime,
+        ST_X(geom) as longitude,
+        ST_Y(geom) as latitude,
+        speed
+        FROM cz_gps
+        WHERE plate_phone = #{platePhone}
+        AND gps_time >= CAST(#{currentTime} AS TIMESTAMP) - CAST(#{maxStayMinutes} || ' minutes' AS INTERVAL)
+        AND gps_time &lt;= CAST(#{currentTime} AS TIMESTAMP)
+        AND geom IS NOT NULL  -- 确保有几何数据
+        ORDER BY gps_time DESC
+        LIMIT 100
+    </select>
+    <select id="selectFenceOut" resultType="java.lang.Boolean">
+        SELECT st_within(
+                    ST_SetSRID(ST_Point(#{longitude}, #{latitude}), 4326),
+                    geom
+                )
+        FROM "public".fence_geom
+        WHERE fence_status='1'
+
+    </select>
+    <select id="existsBySDetectCode" resultType="java.lang.Integer">
+        SELECT COUNT(1) FROM "public".wn_transport_data1 WHERE s_detect_code = #{sDetectCode}
+<!--        SELECT COUNT(1) FROM "public".zy_clczjl WHERE czjlid = #{sDetectCode}-->
+    </select>
+
+    <!-- 更新轨迹 -->
+    <update id="updateSjlxByLdbh">
+        UPDATE zy_ldjl
+        SET sjlx = #{sjlx}
+        WHERE ldbh = #{ldbh}
+    </update>
+
+    <!-- ==================== 更新操作 ==================== -->
+
+    <!-- 更新称重记录中的进厂皮重 -->
+    <update id="updateZyClczjlPizhong">
+        UPDATE public.zy_clczjl
+        SET jcczzl = #{pz}, jcczsj = #{jcczsj}
+        WHERE cphm = #{cphm} AND (jcczzl IS NULL OR jcczzl = 0)
+    </update>
+
+    <!-- 更新称重记录中的出厂称重数据 -->
+    <update id="updateZyClczjlCccz">
+        UPDATE public.zy_clczjl
+        SET ccczzl = #{ccczzl}, ccczsj = #{ccczsj}
+        WHERE cphm = #{cphm} AND (ccczzl IS NULL OR ccczzl = 0)
+    </update>
+
+    <!-- 根据联单号更新运输记录状态 -->
+    <update id="updateZyJzljysStatusByLdbh">
+        UPDATE public.zy_jzljys
+        SET ldzt = #{ldzt}, ysjssj = #{ysjssj}
+        WHERE ldbh = #{ldbh} AND ldzt = '2'
+    </update>
+
+    <!-- 更新联单状态 -->
+    <update id="updateLianDanStatus">
+        UPDATE zy_jzljyc
+        SET ldzt = #{status}
+        WHERE ldbh = #{ldbh}
+    </update>
+
+    <!-- 更新运输结束时间 -->
+    <update id="updateYunShuEndTime">
+        UPDATE zy_jzljys
+        SET ysjssj = #{endTime}
+        WHERE ldbh = #{ldbh}
+        AND ysjssj IS NULL
+    </update>
+
+    <!-- ==================== 插入操作 ==================== -->
+
+    <!-- 插入称重记录 -->
+    <insert id="insertClczjl" parameterType="net.map591.entity.ZyClczjl">
+        <selectKey keyProperty="ldbh" resultType="string" order="BEFORE">
+            select 'LDBH' || to_char(NOW(), 'YYYYMMDD')|| LPAD(nextval('zy_clczjl_seq')::TEXT, 5, '0')
+        </selectKey>
+        INSERT INTO zy_clczjl (
+        czjlid, ldbh, cphm, jsyxm, jsysfzh, czbbh, czlx, jzljlx,
+        czsj, mz, pz, jz, czdd, czcbm, jsgdbh, sjly, zczp, kczp, bz,
+        s_base64_plate_data,s_base64_head_data,s_base64_body_data,s_base64_tail_data,create_time
+        ) VALUES (
+        #{czjlid}, #{ldbh}, #{cphm}, #{jsyxm}, #{jsysfzh}, #{czbbh}, #{czlx}, #{jzljlx},
+        #{czsj}, #{mz}, #{pz}, #{jz}, #{czdd}, #{czcbm}, #{jsgdbh}, #{sjly}, #{zczp}, #{kczp}, #{bz},
+        #{sBase64PlateData},#{sBase64HeadData},#{sBase64BodyData},#{sBase64TailData},#{createTime}
+        )
+    </insert>
+
+    <!-- 插入移出记录 -->
+    <insert id="insertJzljyc" parameterType="net.map591.entity.ZyJzljyc">
+        <selectKey keyProperty="ycdh" resultType="string" order="BEFORE">
+            select 'YC' || to_char(NOW(), 'YYYYMMDD')|| LPAD(nextval('zy_jzljyc_seq')::TEXT, 5, '0')
+        </selectKey>
+        INSERT INTO zy_jzljyc (
+        ycdh, ldbh, ldzt, czjlid, ycrq, ycsj, jzljzl, yscph,
+        jsyxm, jbr, sfkqys, jzljlx, jsgdbh
+        ) VALUES (
+        #{ycdh}, #{ldbh}, #{ldzt}, #{czjlid}, #{ycrq}, #{ycsj}, #{jzljzl}, #{yscph},
+        #{jsyxm}, #{jbr}, #{sfkqys}, #{jzljlx}, #{jsgdbh}
+        )
+    </insert>
+
+    <!-- 插入运输记录 -->
+    <insert id="insertJzljys" parameterType="net.map591.entity.ZyJzljys">
+        <selectKey keyProperty="ysdh" resultType="string" order="BEFORE">
+            select 'YS' || to_char(NOW(), 'YYYYMMDD')|| LPAD(nextval('zy_jzljys_seq')::TEXT, 5, '0')
+        </selectKey>
+        INSERT INTO zy_jzljys (
+        ysdh, ldbh, ldzt, cphm, ysrq, yskssj, ysqd, yszd,yslx,sjlx, yszl,yssc,
+           bz
+        ) VALUES (
+        #{ysdh}, #{ldbh}, #{ldzt}, #{cphm}, #{ysrq}, #{yskssj}, #{ysqd}, #{yszd},#{yslx},#{sjlx},#{yssc},
+        #{yszl},#{bz}
+        )
+    </insert>
+
+    <!-- 插入接收记录 -->
+    <insert id="insertJzljjs" parameterType="net.map591.entity.ZyJzljjs">
+        <selectKey keyProperty="snjlid" resultType="string" order="BEFORE">
+            select 'JS' || to_char(NOW(), 'YYYYMMDD')|| LPAD(nextval('zy_jzljjs_seq')::TEXT, 5, '0')
+        </selectKey>
+        INSERT INTO zy_jzljjs (
+        snjlid, ldbh, ldzt, czjlid, cphm, snrq, snsj, czjz,
+        jbr, czcbm, czcmc
+        ) VALUES (
+        #{snjlid}, #{ldbh}, #{ldzt}, #{czjlid}, #{cphm}, #{snrq}, #{snsj}, #{czjz},
+        #{jbr}, #{czcbm}, #{czcmc}
+        )
+    </insert>
+
+    <!-- 插入原始数据 -->
+    <insert id="insertWnData" parameterType="net.map591.entity.WnTransportData">
+        INSERT INTO wn_transport_data (
+        s_detect_code, s_site_code, s_date_time, s_plate_name, n_total_weight,
+        n_enter_channel, n_enter_aspect, s_exit_time, s_base64_body_data,
+        driver_name, carid, consignee, dispatcher, product_name, suttle,
+        notes, ldbh, czjlid, ldzt
+        ) VALUES (
+        #{sDetectCode}, #{sSiteCode}, #{sDateTime}, #{sPlateName}, #{nTotalWeight},
+        #{nEnterChannel}, #{nEnterAspect}, #{sExitTime}, #{sBase64BodyData},
+        #{driverName}, #{carid}, #{consignee}, #{dispatcher}, #{productName}, #{suttle},
+        #{notes}, #{ldbh}, #{czjlid}, '0'
+        )
+    </insert>
+
+    <!-- 更新接收表联单状态 -->
+    <update id="updateJsLianDanStatus">
+        UPDATE zy_jzljjs
+        SET ldzt = #{status}
+        WHERE ldbh = #{ldbh}
+    </update>
+
+    <!-- 更新运输表联单状态 -->
+    <update id="updateYsLianDanStatus">
+        UPDATE zy_jzljys
+        SET ldzt = #{status}
+        WHERE ldbh = #{ldbh}
+    </update>
+    <update id="updateSjlx">
+        UPDATE zy_jzljys SET sjlx = ST_GeomFromText(#{trackLine}) WHERE ldbh = #{ldbh}
+    </update>
+    <update id="updateLianDanStatusToAbnormal">
+        UPDATE zy_jzljyc
+        SET ldzt = '4'  <!-- 异常状态 -->
+        WHERE ldbh = #{ldbh}
+        AND ldzt != '4'  <!-- 避免重复更新 -->
+    </update>
+
+    <!-- 同时更新运输表中的联单状态 -->
+    <update id="updateYsLianDanStatusToAbnormal">
+        UPDATE zy_jzljys
+        SET ldzt = '4'
+        WHERE ldbh = #{ldbh}
+        AND ldzt != '4'
+    </update>
+
+    <!-- 同时更新接收表中的联单状态 -->
+    <update id="updateJsLianDanStatusToAbnormal">
+        UPDATE zy_jzljjs
+        SET ldzt = '4'
+        WHERE ldbh =  #{ldbh}
+        AND ldzt != '4'
+    </update>
+
+
+    <insert id="insertWnData1" parameterType="net.map591.entity.WnTransportData">
+        INSERT INTO wn_transport_data1 (
+        s_detect_code, s_site_code, s_date_time, s_plate_name,
+        n_total_weight, n_enter_channel, n_enter_aspect, s_exit_time,
+        s_base64_head_data, s_base64_tail_data, s_base64_body_data, s_base64_plate_data,
+        vehicle_type, driver_name, carid, phone, drivers_license, driving_license,
+        weigh_mode, operator_one, operator_two, operation_one_time, operation_two_time,
+        operating_unit, specs, consignee, dispatcher, product_name, weigh_type,
+        suttle, time_stamp_one, time_stamp_two, unit, time_stamp_one_time, time_stamp_one_photo,
+        time_stamp_two_time, time_stamp_two_photo, modifications, last_modification_time,
+        erp_id, notes, consignee_man, dispatcher_man, responsible_entity, ldbh, czjlid, ldzt
+        ) VALUES (
+        #{sDetectCode}, #{sSiteCode}, #{sDateTime}, #{sPlateName},
+        #{nTotalWeight}, #{nEnterChannel}, #{nEnterAspect}, #{sExitTime},
+        #{sBase64HeadData}, #{sBase64TailData}, #{sBase64BodyData}, #{sBase64PlateData},
+        #{vehicleType}, #{driverName}, #{carid}, #{phone}, #{driversLicense}, #{drivingLicense},
+        #{weighMode}, #{operatorOne}, #{operatorTwo}, #{operationOneTime}, #{operationTwoTime},
+        #{operatingUnit}, #{specs}, #{consignee}, #{dispatcher}, #{productName}, #{weighType},
+        #{suttle}, #{timeStampOne}, #{timeStampTwo}, #{unit}, #{timeStampOneTime}, #{timeStampOnePhoto},
+        #{timeStampTwoTime}, #{timeStampTwoPhoto}, #{modifications}, #{lastModificationTime},
+        #{erpId}, #{notes}, #{consigneeMan}, #{dispatcherMan}, #{responsibleEntity}, #{ldbh}, #{czjlid}, '0'
+        )
+    </insert>
+    <insert id="insertAlarmRecord" parameterType="net.map591.entity.JgzcYcbj" flushCache="true">
+        <selectKey keyProperty="bjjlid" resultType="String" order="BEFORE">
+            SELECT 'BJ' || TO_CHAR(NOW(), 'YYYYMMDD') || LPAD(NEXTVAL('bj_id_seq')::TEXT, 5, '0')
+        </selectKey>
+        insert into jgzc_ycbj
+        <trim prefix="(" suffix=")" suffixOverrides=",">
+            <if test="bjjlid != null">
+                bjjlid,
+            </if>
+            <if test="glywdh != null">
+                glywdh,
+            </if>
+            <if test="ywlx != null">
+                ywlx,
+            </if>
+            <if test="bjlz != null">
+                bjlz,
+            </if>
+            <if test="bjsj != null">
+                bjsj,
+            </if>
+            <if test="bjdjdz != null">
+                bjdjdz,
+            </if>
+            <if test="bjjb != null">
+                bjjb,
+            </if>
+            <if test="cphm != null">
+                cphm,
+            </if>
+            <if test="czyf != null">
+                czyf,
+            </if>
+            <if test="czzt != null">
+                czzt,
+            </if>
+            <if test="czr != null">
+                czr,
+            </if>
+            <if test="czsj != null">
+                czsj,
+            </if>
+            <if test="fjxx != null">
+                fjxx,
+            </if>
+            <if test="bz != null">
+                bz,
+            </if>
+        </trim>
+        <trim prefix="values (" suffix=")" suffixOverrides=",">
+            <if test="bjjlid != null">
+                #{bjjlid,jdbcType=VARCHAR},
+            </if>
+            <if test="glywdh != null">
+                #{glywdh,jdbcType=VARCHAR},
+            </if>
+            <if test="ywlx != null">
+                #{ywlx,jdbcType=CHAR},
+            </if>
+            <if test="bjlz != null">
+                #{bjlz,jdbcType=CHAR},
+            </if>
+            <if test="bjsj != null">
+                #{bjsj,jdbcType=TIMESTAMP},
+            </if>
+            <if test="bjdjdz != null">
+                ST_GeomFromText(#{bjdjdz,jdbcType=VARCHAR}, 4326),
+            </if>
+            <if test="bjjb != null">
+                #{bjjb,jdbcType=CHAR},
+            </if>
+            <if test="cphm != null">
+                #{cphm,jdbcType=VARCHAR},
+            </if>
+            <if test="czyf != null">
+                #{czyf,jdbcType=VARCHAR},
+            </if>
+            <if test="czzt != null">
+                #{czzt,jdbcType=CHAR},
+            </if>
+            <if test="czr != null">
+                #{czr,jdbcType=VARCHAR},
+            </if>
+            <if test="czsj != null">
+                #{czsj,jdbcType=TIMESTAMP},
+            </if>
+            <if test="fjxx != null">
+                #{fjxx,jdbcType=VARCHAR},
+            </if>
+            <if test="bz != null">
+                #{bz,jdbcType=VARCHAR},
+            </if>
+        </trim>
+    </insert>
+    <!-- 插入预警记录 -->
+    <insert id="insertYjjl" parameterType="net.map591.ai.ZyYjjl">
+        <selectKey keyProperty="yjid" resultType="string" order="BEFORE">
+            SELECT 'YJ' || to_char(NOW(), 'YYYYMMDD') || LPAD(nextval('zy_yjjl_seq')::TEXT, 5, '0')
+        </selectKey>
+        INSERT INTO zy_yjjl (
+        yjid, ldbh, cphm, yjlx, yjms, yjsj, clzt, bz, track_line, alarm_point,
+        stay_start_time, stay_end_time, transport_start_time, transport_current_time
+        ) VALUES (
+        #{yjid}, #{ldbh}, #{cphm}, #{yjlx}, #{yjms},
+        #{yjsj, jdbcType=TIMESTAMP}, #{clzt}, #{bz}, st_asText(#{trackLine}) , st_asText(#{alarmPoint}),
+        #{stayStartTime, jdbcType=TIMESTAMP}, #{stayEndTime, jdbcType=TIMESTAMP},
+        #{transportStartTime, jdbcType=TIMESTAMP}, #{transportCurrentTime, jdbcType=TIMESTAMP}
+        )
+    </insert>
+    <!-- 插入联单记录 -->
+    <insert id="insertLdjl" parameterType="net.map591.ai.ZyLdjl">
+        <selectKey keyProperty="ldid" resultType="string" order="BEFORE">
+            SELECT 'LD' || to_char(NOW(), 'YYYYMMDD') || LPAD(nextval('zy_ldjl_seq')::TEXT, 5, '0')
+        </selectKey>
+        INSERT INTO zy_ldjl (
+        ldid, ldbh, cphm, ldzt,
+        ycczjlid, ycczdd, ycczsj, ycjz, ycjsgdbh, ycczcbm,
+        jscczjlid, jscczdd, jscczsj, jscjz, jscjsgdbh, jscczcbm,
+        sjlx, create_time, complete_time, update_time
+        ) VALUES (
+        #{ldid}, #{ldbh}, #{cphm}, #{ldzt},
+        #{ycczjlid}, #{ycczdd}, #{ycczsj}, #{ycjz}, #{ycjsgdbh}, #{ycczcbm},
+        #{jscczjlid}, #{jscczdd}, #{jscczsj}, #{jscjz}, #{jscjsgdbh}, #{jscczcbm},
+        st_asText(#{sjlx}), #{createTime, jdbcType=TIMESTAMP}, #{completeTime, jdbcType=TIMESTAMP}, #{updateTime, jdbcType=TIMESTAMP}
+        )
+    </insert>
+
+    <!-- 根据联单号查询联单信息 -->
+    <select id="selectLdjlByLdbh" resultType="net.map591.ai.ZyLdjl">
+        SELECT
+       *
+        FROM zy_ldjl
+        WHERE ldbh = #{ldbh}
+    </select>
+
+
+    <!-- 更新完整联单信息 -->
+    <update id="updateLdjl" parameterType="net.map591.ai.ZyLdjl">
+        UPDATE zy_ldjl
+        SET ldzt = #{ldzt},
+        jscczjlid = #{jscczjlid},
+        jscczdd = #{jscczdd},
+        jscczsj = #{jscczsj},
+        jscjz = #{jscjz},
+        jscjsgdbh = #{jscjsgdbh},
+        jscczcbm = #{jscczcbm},
+        complete_time = #{completeTime, jdbcType=TIMESTAMP},
+        update_time = #{updateTime, jdbcType=TIMESTAMP}
+        WHERE ldbh = #{ldbh}
+    </update>
+
+    <!-- 插入车辆位置点 -->
+    <insert id="insertClwz" parameterType="net.map591.ai.ZyClwz">
+        <selectKey keyProperty="id" resultType="long" order="BEFORE">
+            SELECT nextval('zy_clwz_seq')
+        </selectKey>
+        INSERT INTO zy_clwz (
+        ldbh, cphm, longitude, latitude, speed, direction, gps_time
+        ) VALUES (
+        #{ldbh}, #{cphm}, #{longitude}, #{latitude}, #{speed}, #{direction}, #{gpsTime, jdbcType=TIMESTAMP}
+        )
+    </insert>
+
+
+    <!-- 根据联单号查询轨迹点 -->
+    <select id="selectClwzByLdbh" resultType="net.map591.ai.ZyClwz">
+        SELECT
+        id, ldbh, cphm, longitude, latitude,
+        speed, direction, gps_time as gpsTime, create_time as createTime
+        FROM zy_clwz
+        WHERE ldbh = #{ldbh}
+        ORDER BY gps_time ASC
+    </select>
+
+
+    <!-- 查询最近相似记录 -->
+    <select id="selectRecentData" resultType="net.map591.entity.WnTransportData">
+        SELECT * FROM wn_transport_data1
+        WHERE s_plate_name = #{sPlateName}
+        AND s_site_code = #{sSiteCode}
+        AND s_date_time = #{sDateTime}
+        AND created_at >= NOW() - INTERVAL '${minutes} minutes'
+        ORDER BY created_at DESC
+    </select>
+
+
+    <!-- 检查点是否在电子围栏内 -->
+    <select id="checkPointInFence" resultType="boolean">
+        SELECT EXISTS(
+            SELECT 1 FROM fence_geom f
+            WHERE ST_Contains(
+                f.geom,
+                ST_SetSRID(ST_MakePoint(#{longitude}, #{latitude}), 4326)
+            )
+        )
+    </select>
+
+    <!-- 计算点到路线的距离 -->
+    <select id="calculateDistanceToRoute" resultType="double">
+        SELECT ST_Distance(
+        ST_SetSRID(ST_MakePoint(#{longitude}, #{latitude}), 4326)::geography,
+             (SELECT rg.geom FROM route_cph rc
+                JOIN route_geometry rg ON rc.route_id = rg.route_id
+                JOIN route_template rt ON rc.route_id = rt.id
+                JOIN route_rule rr ON rc.route_id = rr.route_id
+                WHERE rr.rule_type = '1'
+                AND  rc.cph = #{platePhone})::geography
+        )
+    </select>
+
+    <resultMap id="routePlanResultMap" type="net.map591.ai.RoutePlanInfo">
+        <id property="cph" column="cph"/>
+        <result property="routeId" column="route_id"/>
+        <result property="routeName" column="route_name"/>
+        <result property="geom" column="geom_wkt"/>
+        <result property="routeHc" column="route_hc"/>
+
+        <!-- 路线偏离规则 -->
+        <association property="deviation" javaType="net.map591.ai.RoutePlanInfo$DeviationRule">
+            <result property="yzValueMin" column="deviation_min"/>
+            <result property="yzValueMax" column="deviation_max"/>
+        </association>
+
+        <!-- 超时停留规则 -->
+        <association property="stay" javaType="net.map591.ai.RoutePlanInfo$StayTimeoutRule">
+            <result property="yzValueMin" column="stay_min"/>
+            <result property="yzValueMax" column="stay_max"/>
+        </association>
+
+        <!-- 运输超时规则 -->
+        <association property="transport" javaType="net.map591.ai.RoutePlanInfo$TransportTimeoutRule">
+            <result property="yzValueMin" column="transport_min"/>
+            <result property="yzValueMax" column="transport_max"/>
+        </association>
+    </resultMap>
+    <!-- 获取车辆路线规划信息 -->
+    <select id="getRouteInfoByPlate" resultMap="routePlanResultMap">
+        SELECT
+        rc.cph,
+        rt.id as route_id,
+        rt.route_name,
+        ST_AsText(rg.geom) as geom_wkt,
+        rg.route_hc,
+
+        -- 路线偏离规则 (rule_type = '1')
+        MAX(CASE WHEN rr.rule_type = '1' THEN rr.yz_value_min END) as deviation_min,
+        MAX(CASE WHEN rr.rule_type = '1' THEN rr.yz_value_max END) as deviation_max,
+
+        -- 超时停留规则 (rule_type = '2')
+        MAX(CASE WHEN rr.rule_type = '2' THEN rr.yz_value_min END) as stay_min,
+        MAX(CASE WHEN rr.rule_type = '2' THEN rr.yz_value_max END) as stay_max,
+
+        -- 运输超时规则 (rule_type = '3')
+        MAX(CASE WHEN rr.rule_type = '3' THEN rr.yz_value_min END) as transport_min,
+        MAX(CASE WHEN rr.rule_type = '3' THEN rr.yz_value_max END) as transport_max
+
+        FROM route_cph rc
+        JOIN route_geometry rg ON rc.route_id = rg.route_id
+        JOIN route_template rt ON rc.route_id = rt.id
+        LEFT JOIN route_rule rr ON rc.route_id = rr.route_id
+        WHERE rc.cph = #{platePhone}
+        GROUP BY rc.cph, rt.id, rt.route_name, rg.geom, rg.route_hc
+    </select>
+    <!-- 使用PostGIS计算两点距离 -->
+    <select id="calculateDistanceWithPostGIS" resultType="double">
+        SELECT ST_Distance(
+        ST_SetSRID(ST_MakePoint(#{lon1}, #{lat1}), 4326)::geography,
+        ST_SetSRID(ST_MakePoint(#{lon2}, #{lat2}), 4326)::geography
+        ) as distance
+    </select>
+</mapper>
